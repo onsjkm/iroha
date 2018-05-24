@@ -15,7 +15,6 @@
 // (postponed) TODO: limit nightly build pipeline execution for 3 days max
 // (pending) TODO: how to do all types of tests on all platforms (create stage in parallel for each platform and test - 4x5=20?!?!)
 // TODO: upload artifacts at the post stage of each platform
-// (urgent) TODO: add /opt/.ccache somehow to the agent (such that it could be mounted as a volume to docker)
 
 properties([parameters([
   choice(choices: 'Debug\nRelease', description: '', name: 'BUILD_TYPE'),
@@ -54,6 +53,9 @@ pipeline {
     IROHA_POSTGRES_PASSWORD = "${GIT_COMMIT}"
     IROHA_POSTGRES_PORT = 5432
 
+    IS_MERGE_ACCEPTED = ''
+    GIT_COMMITER_EMAIL = ''
+
     dockerAgentImage = ''
     dockerImageFile = ''
     workspace_path = ''
@@ -70,6 +72,7 @@ pipeline {
       agent { label 'master' }
       steps {
         script {
+          GIT_COMMITER_EMAIL = sh(script: """git --no-pager show -s --format='%ae' ${env.GIT_COMMIT}""", returnStdout: true).trim()
           if (GIT_LOCAL_BRANCH != "develop") {
             def builds = load ".jenkinsci/cancel-builds-same-job.groovy"
             builds.cancelSameJobBuilds()
@@ -144,8 +147,8 @@ pipeline {
             beforeAgent true
             anyOf {
               allOf {
-                expression { env.CHANGE_ID != null }
-                expression { GIT_PREVIOUS_COMMIT == null } // on the open PR
+                expression { return env.CHANGE_ID }
+                not { expression { return GIT_PREVIOUS_COMMIT } }
               }
               expression { return params.MacOS }
             }
@@ -172,8 +175,8 @@ pipeline {
         anyOf {
           expression { params.Coverage }  // by request
           allOf {
-            expression { env.CHANGE_ID != null }
-            expression { GIT_PREVIOUS_COMMIT == null } // on the open PR
+            expression { return env.CHANGE_ID }
+            not { expression { return GIT_PREVIOUS_COMMIT } }
           }
           allOf {
             expression { params.BUILD_TYPE == 'Debug' }
@@ -279,8 +282,8 @@ pipeline {
         anyOf {
           expression { params.Coverage }  // by request
           allOf {
-            expression { env.CHANGE_ID != null }
-            expression { GIT_PREVIOUS_COMMIT == null } // on the open PR
+            expression { return env.CHANGE_ID }
+            not { expression { return GIT_PREVIOUS_COMMIT } }
           }
           allOf {
             expression { params.BUILD_TYPE == 'Debug' }
@@ -493,41 +496,35 @@ pipeline {
     stage ('Pre-merge request') {
       when {
         allOf {
-          expression { env.CHANGE_ID != null }
-          expression { GIT_PREVIOUS_COMMIT != null } // on the commit to PR
+          expression { return env.CHANGE_ID }
+          expression { return GIT_PREVIOUS_COMMIT }
         }
       }
-      agent { label 'master' }
       steps {
         script {
           if ( ! params.Merge_PR ) {
-            input {
-              message "Merge current Pull Request?"
-              ok "Merge"
-              parameters {
-                booleanParam(name: 'MERGE', defaultValue: 'false', description: 'Whether to merge PR?')
-              }
+            env.inputData = input message: 'Would you like to merge current PR?', ok: 'Merge'//, parameters: [booleanParam(defaultValue: false, description: 'Whether to merge current PR', name: 'MERGE')]
+
+            if ( env.inputData ) {
+              sh "echo merge is going to happen"
+              IS_MERGE_ACCEPTED = "true"
             }
-            if ( params.MERGE ) {
-              params.Merge_PR = true
-            }
-          }
-          if ( params.Merge_PR ) {
-            params.ARMv7 = !params.ARMv7
-            params.ARMv8 = !params.ARMv8
-            params.Linux = !params.Linux
-            params.MacOS = !params.MacOS
           }
         }
       }
     }
     stage ('Pre-merge build') {
-      when { expression { params.MERGE_PR } }
+      when {
+        anyOf {
+          expression { return params.MERGE_PR }
+          expression { return IS_MERGE_ACCEPTED == "true" }
+        }
+      }
       parallel {
         stage ('Linux') {
           when {
             beforeAgent true
-            expression { return params.Linux }
+            not { expression { return params.Linux } }
           }
           agent { label 'x86_64_aws_build' }
           steps { 
@@ -540,7 +537,7 @@ pipeline {
         stage('ARMv7') {
           when {
             beforeAgent true
-            expression { return params.ARMv7 }
+            not { expression { return params.ARMv7 } }
           }
           agent { label 'armv7' }
           steps { 
@@ -553,7 +550,7 @@ pipeline {
         stage('ARMv8') {
           when {
             beforeAgent true
-            expression { return params.ARMv8 }
+            not { expression { return params.ARMv8 } }
           }
           agent { label 'armv8' }
           steps {
@@ -566,7 +563,7 @@ pipeline {
         stage('MacOS') {
           when {
             beforeAgent true
-            expression { return params.MacOS }
+            not { expression { return params.MacOS } }
           }
           agent { label 'mac' }
           steps {
@@ -579,7 +576,12 @@ pipeline {
       }
     }
     stage ('Pre-merge test') {
-      when { expression { params.MERGE_PR } }
+      when {
+        anyOf {
+          expression { return params.MERGE_PR }
+          expression { return IS_MERGE_ACCEPTED == "true" }
+        }
+      }
       parallel {
         stage ('Linux') {
           agent { label 'x86_64_aws_build' }
@@ -625,18 +627,25 @@ pipeline {
     }
   }
   post {
-     // TODO: send email-notifications logic 
-    always {
+    // TODO: learn about of order: always in post-step executes before 
+    success {
       script {
-        GIT_AUTHOR_EMAIL = sh(script: """git --no-pager show -s --format='%ae' ${env.GIT_COMMIT}""", returnStdout: true).trim()
+        // merge pull request if everything is ok
+        def merge = load ".jenkinsci/github-merge.groovy"
+        currentBuild.result = merge.mergePullRequest() ? "SUCCESS" : "FAILURE"
+      }
+    }
+    cleanup {
+      script {
+        // TODO: prepare email body content somehow (e.g. using class)
+        sh "echo ${currentBuild.result}"
       }
       emailext( subject: '$DEFAULT_SUBJECT',
                 body: '$DEFAULT_CONTENT',
                 attachLog: true,
                 compressLog: true,
-                to: "${GIT_AUTHOR_EMAIL}"
+                to: "${GIT_COMMITER_EMAIL}"
       )
-      // clear workspace on agents and 
       script {
         if ( params.Linux ) {
           node ('x86_64_aws_test') {

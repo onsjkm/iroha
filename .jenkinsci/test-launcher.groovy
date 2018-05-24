@@ -8,7 +8,7 @@
 // - "system_" for system tests, respectively.
 
 def chooseTestType() {
-	if ( params.Merge_PR ) {
+	if ( params.Merge_PR || env.IS_MERGE_ACCEPTED == 'true' ) {
 		return "(module|integration|system|regression)*"
 	}
 	if ( params.Nightly )
